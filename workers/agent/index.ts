@@ -306,6 +306,7 @@ export class EmailAgent extends AIChatAgent<any> {
 					sender: string;
 					subject: string;
 					threadId: string;
+					subaddressTag?: string | null;
 				};
 				const result = await this.handleNewEmail(emailData);
 				return new Response(JSON.stringify(result), {

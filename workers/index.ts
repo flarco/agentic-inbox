@@ -255,6 +255,22 @@ app.post("/api/v1/mailboxes/:mailboxId/emails/:id/move", async (c: AppContext) =
 	return success ? c.json({ status: "moved" }) : c.json({ error: "Folder not found" }, 400);
 });
 
+// -- Real-time subscription (WebSocket) -----------------------------
+
+// Cloudflare Access validates the cf-access-jwt-assertion header on the HTTP
+// upgrade handshake (see workers/app.ts). After the 101 response the socket
+// inherits that trust until close — there is no per-frame re-auth. This is
+// acceptable because requireMailbox keys the DO per-mailbox, so the
+// authenticated client can only see traffic for the mailbox they reached.
+// Browser clients are out of scope for v1: `new WebSocket()` cannot set the
+// Access JWT header on the handshake.
+app.get("/api/v1/mailboxes/:mailboxId/subscribe", async (c: AppContext) => {
+	if (c.req.header("upgrade")?.toLowerCase() !== "websocket") {
+		return c.text("Expected websocket", 426);
+	}
+	return c.var.mailboxStub.fetch(c.req.raw);
+});
+
 // -- Threads --------------------------------------------------------
 
 app.get("/api/v1/mailboxes/:mailboxId/threads/:threadId", async (c: AppContext) => {
@@ -356,11 +372,27 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 
+	// RFC 5233 subaddressing: jobi+tag@ocral.org → mailbox jobi@ocral.org, tag = "tag".
+	const splitSubaddress = (addr: string): { base: string; tag: string | null } => {
+		const at = addr.lastIndexOf("@");
+		if (at < 0) return { base: addr, tag: null };
+		const local = addr.slice(0, at), domain = addr.slice(at);
+		const plus = local.indexOf("+");
+		if (plus < 0) return { base: addr, tag: null };
+		return { base: local.slice(0, plus) + domain, tag: local.slice(plus + 1) || null };
+	};
+
 	let mailboxId: string | undefined;
+	let subaddressTag: string | null = null;
 	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
+		const match = allRecipients.map(splitSubaddress).find((r) => allowedAddresses.includes(r.base));
+		if (!match) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
+		mailboxId = match.base;
+		subaddressTag = match.tag;
+	} else {
+		const first = allRecipients[0];
+		if (first) { const r = splitSubaddress(first); mailboxId = r.base; subaddressTag = r.tag; }
+	}
 	if (!mailboxId) throw new Error("received email with no valid recipient address");
 
 	const messageId = crypto.randomUUID();
@@ -405,7 +437,7 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 	const agentStub = env.EMAIL_AGENT.get(env.EMAIL_AGENT.idFromName(mailboxId));
 	ctx.waitUntil(agentStub.fetch(new Request("https://agents/onNewEmail", {
 		method: "POST", headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId }),
+		body: JSON.stringify({ mailboxId, emailId: messageId, sender: (parsedEmail.from?.address || "").toLowerCase(), subject: parsedEmail.subject || "", threadId, subaddressTag }),
 	})).catch((e) => console.error("Auto-draft trigger failed:", (e as Error).message)));
 }
 

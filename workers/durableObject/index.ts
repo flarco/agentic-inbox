@@ -107,6 +107,85 @@ export class MailboxDO extends DurableObject<Env> {
 		super(state, env);
 		this.db = drizzle(this.ctx.storage, { schema });
 		applyMigrations(this.ctx.storage.sql, mailboxMigrations, this.ctx.storage);
+		// Keepalive auto-response: client "ping" frames are answered with
+		// "pong" inside the runtime without rehydrating the DO from
+		// hibernation. Idempotent across rehydrations because the
+		// constructor runs on wake.
+		this.ctx.setWebSocketAutoResponse(
+			new WebSocketRequestResponsePair("ping", "pong"),
+		);
+	}
+
+	// ── WebSocket subscription (Hibernation API) ───────────────────
+
+	async fetch(request: Request): Promise<Response> {
+		if (request.headers.get("Upgrade") !== "websocket") {
+			return new Response("Expected websocket", { status: 426 });
+		}
+
+		// Parse desired event filter from ?events=inbox.new,email.any
+		const url = new URL(request.url);
+		const rawEvents = url.searchParams.get("events");
+		const events = rawEvents
+			? rawEvents.split(",").map((s) => s.trim()).filter(Boolean)
+			: ["inbox.new"];
+
+		const pair = new WebSocketPair();
+		const [client, server] = Object.values(pair);
+
+		// Persist the filter on the server-side socket so the runtime can
+		// rehydrate it after hibernation. Well under the 2KB cap.
+		server.serializeAttachment({ events });
+
+		this.ctx.acceptWebSocket(server, ["subscriber"]);
+
+		return new Response(null, { status: 101, webSocket: client });
+	}
+
+	webSocketMessage(_ws: WebSocket, _message: string | ArrayBuffer): void {
+		// "ping" frames are consumed by the auto-response pair and never
+		// reach this handler. Any other inbound message is reserved for
+		// future client-issued commands; ignore safely for now.
+	}
+
+	webSocketClose(
+		ws: WebSocket,
+		code: number,
+		reason: string,
+		_wasClean: boolean,
+	): void {
+		// Defensive close — safe to call even if already closed.
+		try {
+			ws.close(code, reason);
+		} catch {
+			/* already closed */
+		}
+	}
+
+	webSocketError(_ws: WebSocket, err: unknown): void {
+		console.error("[MailboxDO] WS error:", err);
+		// The runtime closes the socket itself; nothing else to do.
+	}
+
+	private broadcast(eventType: string, payload: object): void {
+		const msg = JSON.stringify({ type: eventType, ...payload });
+		for (const ws of this.ctx.getWebSockets("subscriber")) {
+			try {
+				const att = ws.deserializeAttachment() as
+					| { events?: string[] }
+					| null;
+				const allowed = att?.events ?? ["inbox.new"];
+				// Exact match: subscribers must opt into the specific event
+				// type. The two event types ("inbox.new" and "email.any") are
+				// fired side-by-side from createEmail() — one INBOX message
+				// produces one inbox.new + one email.any broadcast, and a
+				// subscriber receives at most one of them.
+				if (!allowed.includes(eventType)) continue;
+				ws.send(msg);
+			} catch (e) {
+				console.error("[MailboxDO] broadcast send failed:", e);
+			}
+		}
 	}
 
 	// ── Email CRUD (Drizzle) ───────────────────────────────────────
@@ -867,6 +946,31 @@ export class MailboxDO extends DurableObject<Env> {
 
 		if (attachments.length > 0) {
 			this.db.insert(schema.attachments).values(attachments).run();
+		}
+
+		// Push notification to any active subscribers. Wrapped in try/catch
+		// because the insert is the source of truth — a broadcast failure
+		// must never break ingestion.
+		try {
+			const eventPayload = {
+				id: email.id,
+				folder_id: folderId,
+				subject: email.subject,
+				sender: email.sender,
+				recipient: email.recipient,
+				date: email.date,
+				thread_id: email.thread_id ?? null,
+				message_id: email.message_id ?? null,
+				has_attachments: attachments.length > 0,
+			};
+			if (folderId === Folders.INBOX) {
+				this.broadcast("inbox.new", eventPayload);
+			}
+			// Subscribers who opted into "email.any" get every create
+			// regardless of folder; the broadcast() filter handles that.
+			this.broadcast("email.any", eventPayload);
+		} catch (e) {
+			console.error("[MailboxDO] broadcast failed in createEmail:", e);
 		}
 	}
 }
