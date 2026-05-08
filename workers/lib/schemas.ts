@@ -84,6 +84,12 @@ export const SendEmailRequestSchema = z
 		in_reply_to: z.string().optional(),
 		references: z.array(z.string()).optional(),
 		thread_id: z.string().optional(),
+		reply_to: z
+			.union([
+				z.string().email(),
+				z.object({ email: z.string().email(), name: z.string() }),
+			])
+			.optional(),
 	})
 	.refine((data) => data.html || data.text, {
 		message: "Either 'html' or 'text' must be provided",
